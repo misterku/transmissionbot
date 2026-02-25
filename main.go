@@ -1,78 +1,85 @@
 package main
 
 import (
-	"fmt"
-	"os/exec"
-	"os"
-	"strconv"
-	"net/url"
 	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
 	"strings"
 
-	"github.com/caarlos0/env/v11"
-
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	transmissionrpc "github.com/hekmon/transmissionrpc/v3"
+	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/hekmon/transmissionrpc/v3"
+	"github.com/spf13/viper"
 )
 
-func getTemperature() (string, error) {
-	fmt.Println("Getting temperature...")
-	cmd := exec.Command("cat", "/sys/class/thermal/thermal_zone0/temp")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	out := strings.TrimSpace(string(output))
-	temperature, err := strconv.Atoi(out)
-	if err != nil {
-		return "", err
-	}
-	temperature = temperature / 1000
-	return strconv.Itoa(temperature), nil
-}
-
-func sendTemperature(bot *tgbotapi.BotAPI, chatID int64) error {
-	temperature, err := getTemperature()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Temperature: %s\n", temperature)
-
-	msg := tgbotapi.NewMessage(chatID, temperature)
-	_, err = bot.Send(msg)
-	return err
-}
-
-func newTransmissionClient(username string, password string, host string) *transmissionrpc.Client {
-	endpoint, err := url.Parse("http://" + username + ":" + password + "@" + host + ":9091/transmission/rpc")
-	if err != nil {
-		panic(err)
-	}
-	tbt, err := transmissionrpc.New(endpoint, nil)
-	if err != nil {
-		panic(err)
-	}
-	return tbt
-}
-
 type Config struct {
-	Token string `env:"TELEGRAM_TOKEN,required"`
-	Username string `env:"TRANSMISSION_USERNAME" default:"transmission"`
-	Password string `env:"TRANSMISSION_PASSWORD,required"`
-	Host string `env:"TRANSMISSION_HOST" default:"127.0.0.1"`
+    Token       string `mapstructure:"telegram_token"`
+    AllowedUIDs []int64 `mapstructure:"allowed_uids"`
+    Transmission struct {
+        Username string `mapstructure:"username"`
+        Password string `mapstructure:"password"`
+        Host     string `mapstructure:"host"`
+        Port     int    `mapstructure:"port"`
+        Scheme   string `mapstructure:"scheme"`
+    } `mapstructure:"transmission"`
 }
+
 
 func parseConfig() Config {
+	v := viper.New()
+
+	// Set defaults
+	v.SetDefault("telegram_token", "")
+	v.SetDefault("allowed_uids", []int64{})
+	v.SetDefault("transmission.username", "transmission")
+	v.SetDefault("transmission.password", "")
+	v.SetDefault("transmission.host", "127.0.0.1")
+	v.SetDefault("transmission.port", 9091)
+
+	// Config file
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(".")
+	v.AddConfigPath("/etc/transmissionbot/")
+
+	// Environment variables
+	v.AutomaticEnv()
+
+	// Read config
+	if err := v.ReadInConfig(); err != nil {
+		if !strings.Contains(err.Error(), "Config File Not Found") {
+			panic(err)
+		}
+		// Config file not found; ignore, we'll rely on defaults/env
+	}
+
 	var cfg Config
-	err := env.Parse(&cfg)
-	if err != nil {
+	if err := v.Unmarshal(&cfg); err != nil {
 		panic(err)
 	}
-	return cfg
-} 
 
-func invalidUid(uid int64) bool {
-	return uid != 68898121
+	// Validate required fields
+	if cfg.Token == "" {
+		panic("telegram_token is required")
+	}
+	if cfg.Transmission.Password == "" {
+		panic("transmission_password is required")
+	}
+	if cfg.Transmission.Scheme == "" {
+		panic("transmission_scheme is required")
+	}
+
+	return cfg
+}
+
+func invalidUid(uid int64, allowed []int64) bool {
+	for _, allowedUID := range allowed {
+		if uid == allowedUID {
+			return false
+		}
+	}
+	return true
 }
 
 type appState struct {
@@ -90,16 +97,7 @@ func NewAppState() *appState {
 	}
 	bot.Debug = true
 	
-	transmissionClient := newTransmissionClient(cfg.Username, cfg.Password, cfg.Host)
-	ok, serverVersion, serverMinimumVersion, err := transmissionClient.RPCVersion(context.TODO())
-	if err != nil {
-		panic(err)
-	}
-	if !ok {
-		panic(fmt.Sprintf("Remote transmission RPC version (v%d) is incompatible with the transmission library (v%d): remote needs at least v%d",
-			serverVersion, transmissionrpc.RPCVersion, serverMinimumVersion))
-	}
-
+	transmissionClient := NewTransmissionClient(cfg.Transmission.Username, cfg.Transmission.Password, cfg.Transmission.Host, cfg.Transmission.Scheme, cfg.Transmission.Port)
 	return &appState{bot, transmissionClient, cfg}
 }
 
@@ -119,21 +117,21 @@ func downloadFile(bot *tgbotapi.BotAPI, fileID string, chatID int64, cfg Config)
 	return nil
 }
 
-func sendFileToTransmission(client *transmissionrpc.Client, fileID string, chatID int64) error {
-	dir, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	filename:= dir + "/downloads/" + fileID + ".torrent"
-	_, err = client.TorrentAddFile(context.TODO(), filename)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-
 func main() {
+	// Setup logger
+	logLevel := slog.LevelDebug
+	if level := os.Getenv("LOG_LEVEL"); level == "info" {
+		logLevel = slog.LevelInfo
+	} else if level == "warn" {
+		logLevel = slog.LevelWarn
+	} else if level == "error" {
+		logLevel = slog.LevelError
+	}
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel,
+	})
+	slog.SetDefault(slog.New(handler))
+
 	state := NewAppState()
 
 	updateConfig := tgbotapi.NewUpdate(0)
@@ -143,12 +141,12 @@ func main() {
 
 	for update := range updates {
 		if update.Message == nil {
-			fmt.Printf("Invalid update (w/o message): %v", update)
+			slog.Debug("Invalid update (w/o message)", "update", update)
 			continue
 		}
 
-		if invalidUid(update.Message.From.ID) {
-			fmt.Errorf("Invalid UID: %v", update.Message.From.ID)
+		if invalidUid(update.Message.From.ID, state.Cfg.AllowedUIDs) {
+			slog.Warn("Invalid UID", "uid", update.Message.From.ID)
 			continue
 		}
 
@@ -156,13 +154,13 @@ func main() {
 			if update.Message.Document.MimeType == "application/x-bittorrent" {
 				err := downloadFile(state.Bot, update.Message.Document.FileID, update.Message.Chat.ID, state.Cfg)
 				if err != nil {
-					fmt.Errorf("Error downloading file: %v", err)
+					slog.Error("Error downloading file", "error", err)
 					state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Error downloading file"))
 					continue
 				}
-				err = sendFileToTransmission(state.Client, update.Message.Document.FileID, update.Message.Chat.ID)
+				err = SendFileToTransmission(state.Client, update.Message.Document.FileID, update.Message.Chat.ID)
 				if err != nil {
-					fmt.Errorf("Error sending file to transmission: %v", err)
+					slog.Error("Error sending file to transmission", "error", err)
 					state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Error sending file to transmission"))
 					continue
 				}
@@ -170,15 +168,44 @@ func main() {
 			}
 		}
 
-		if update.Message.Text == "/temp" {
-			err := sendTemperature(state.Bot, update.Message.Chat.ID)
+		if update.Message.Text == "/cleanup" {
+			cnt, err := Cleanup(context.TODO(), state.Client)
 			if err != nil {
-				fmt.Errorf("Error sending temperature: %v", err)
-				state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Error sending temperature"))
+				slog.Error("Error sending cleanup", "error", err)
+				state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Error sending cleanup: %v", err)))
 			}
+			var message string
+			if cnt == 0 {
+				message = "No active torrents"
+			} else {
+				message = fmt.Sprintf("Active torrents removed: %d", cnt)
+			}
+			state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, message))
 			continue
 		}
 
-		fmt.Println(update)
+		if update.Message.Text == "/status" {
+			active, downloaded, err := StatusOfActiveTorrents(context.TODO(), state.Client)
+			if err != nil {
+				slog.Error("Error sending status", "error", err)
+				state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Error sending status: %v", err)))
+				continue
+			}
+			var message string
+			if active == 0 {
+				message = "No active torrents."
+			} else {
+				message = fmt.Sprintf("Number of active torrents: %d.", active)
+			}
+			if downloaded == 0 {
+				message += " No finished torrents."
+			} else {
+				message += fmt.Sprintf(" Number of finished torrents: %d.", downloaded)
+			}
+			state.Bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, message))
+			continue
+		}
+
+		slog.Debug("Update", "update", update)
 	}
 }
